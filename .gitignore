@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dicom_report_*.md
+non_dicom_*.log
+*.dcm
+*.egg-info
+build/
+dist/
+.DS_Store
