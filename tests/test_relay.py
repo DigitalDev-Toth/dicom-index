@@ -89,6 +89,13 @@ class MockRelay:
         await self.connector_ws.send_json(request_frame)
         return await fut
 
+    async def wait_conn(self, timeout=10):
+        for _ in range(timeout * 10):
+            if self.connector_ws and not self.connector_ws.closed:
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
 
 async def run_mock_relay():
     app = web.Application()
@@ -198,3 +205,79 @@ async def test_relay_large_response():
     conn_task.cancel()
     await api_runner.cleanup()
     await rr.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_relay_reconnect_after_kill():
+    """Simulate relay death without graceful close — connector must
+    detect and reconnect."""
+    import logging
+    import fastwado.relay as relay_mod
+
+    HOST2 = "127.0.0.1"
+    RP2 = RELAY_PORT + 200
+    AP2 = API_PORT + 200
+
+    # Short timeout for test
+    relay_mod.RECV_TIMEOUT = 2
+
+    async def _start_relay():
+        app = web.Application()
+        rly = MockRelay()
+        app.router.add_get("/agent/ws", rly.ws_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, HOST2, RP2).start()
+        return rly, runner
+
+    async def health_handler(request):
+        return web.json_response({"status": "ok"})
+
+    api_app = web.Application()
+    api_app.router.add_get("/health", health_handler)
+    api_runner = web.AppRunner(api_app)
+    await api_runner.setup()
+    await web.TCPSite(api_runner, HOST2, AP2).start()
+
+    # Start first relay
+    relay, relay_runner = await _start_relay()
+
+    from fastwado.relay import RelayConnector
+    connector = RelayConnector(
+        relay_base=f"http://{HOST2}:{RP2}",
+        client="test-kill",
+        token="t",
+        upstream=f"http://{HOST2}:{AP2}",
+    )
+    conn_task = asyncio.create_task(connector.run())
+    await relay.wait_conn(5)
+    assert relay.connector_ws, "never connected to first relay"
+
+    # First request works
+    r = await relay.send_request("GET", "/health", "")
+    status, meta, chunks = r
+    assert status == "ok"
+    assert meta["status"] == 200
+
+    # Kill the relay without graceful close
+    await relay_runner.cleanup()
+    # wait for connector to detect dead connection and reconnect
+    await asyncio.sleep(3)
+
+    # Start second relay
+    relay2, relay2_runner = await _start_relay()
+
+    # Wait for reconnect
+    ok = await relay2.wait_conn(10)
+    assert ok, "connector did not reconnect after relay restart"
+
+    # Second request works through the new relay
+    status2, meta2, chunks2 = await relay2.send_request("GET", "/health", "")
+    assert status2 == "ok"
+    assert meta2["status"] == 200
+
+    # Cleanup
+    conn_task.cancel()
+    relay_mod.RECV_TIMEOUT = relay_mod.PING_TIMEOUT + 10  # restore
+    await api_runner.cleanup()
+    await relay2_runner.cleanup()

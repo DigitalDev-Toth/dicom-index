@@ -18,7 +18,6 @@ import random
 import struct
 import sys
 import time
-from datetime import datetime, timezone
 
 import aiohttp
 
@@ -28,7 +27,10 @@ HEADER_FMT = ">I"
 CHUNK_SIZE = 256 * 1024
 PING_TIMEOUT = 60
 PING_INTERVAL = 20
-RECONNECT_AFTER = 50 * 60  # 50 minutes — proactive refresh
+RECONNECT_AFTER = 50 * 60
+
+# Overridable for testing
+RECV_TIMEOUT = PING_TIMEOUT + 10  # 50 minutes — proactive refresh
 
 
 class RelayConnector:
@@ -98,14 +100,25 @@ class RelayConnector:
     async def _handle_ws(self, ws, session):
         self._ws = ws
         self._session = session
-        self._last_pong = datetime.now(timezone.utc)
-        log.info("Connected to relay (WS) — client=%s url=%s", self.client, self.ws_url)
+        log.info("Connected to relay (WS) — client=%s", self.client)
 
-        watcher = asyncio.create_task(self._watchdog())
         reconnect_timer = asyncio.create_task(self._proactive_reconnect())
 
         try:
-            async for msg in ws:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        ws.receive(), timeout=RECV_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "No WS message for %ds — connection dead, will reconnect",
+                        PING_TIMEOUT + 10,
+                    )
+                    return
+                except asyncio.CancelledError:
+                    raise
+
                 try:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         await self._on_text(msg.data)
@@ -122,20 +135,9 @@ class RelayConnector:
                 except Exception:
                     log.exception("Error processing WS message — continuing")
         finally:
-            watcher.cancel()
             reconnect_timer.cancel()
             self._ws = None
             self._session = None
-
-    async def _watchdog(self):
-        while True:
-            await asyncio.sleep(PING_INTERVAL)
-            ago = (datetime.now(timezone.utc) - self._last_pong).total_seconds()
-            if ago > PING_TIMEOUT:
-                log.error("No pong for %.0fs — forcing close", ago)
-                if self._ws and not self._ws.closed:
-                    await self._ws.close()
-                return
 
     async def _proactive_reconnect(self):
         await asyncio.sleep(RECONNECT_AFTER)
@@ -153,7 +155,6 @@ class RelayConnector:
 
         typ = data.get("type")
         if typ == "ping":
-            self._last_pong = datetime.now(timezone.utc)
             await self._ws.send_json({"type": "pong"})
         elif typ == "request":
             req_id = data.get("id", "?")
