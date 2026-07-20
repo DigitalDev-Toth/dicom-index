@@ -1,26 +1,34 @@
 """Relay connector: WebSocket client that bridges Mirror relay ↔ local API.
 
-Connects to the relay via WebSocket (or long-polling fallback), receives
-proxied requests, executes them against the local API, and returns responses
-with binary chunking per the Relay Mirror protocol.
+Connects to the relay via WebSocket, receives proxied requests, executes them
+against the local API, and returns responses with binary chunking per the
+Relay Mirror protocol.
+
+Reconnect behaviour:
+- Reconnects on ANY disconnection with exponential backoff 1 s → 30 s (+ jitter).
+- Proactive reconnect every 50 min (Cloud Run cuts WS at 60 min).
+- Loop never exits (except on 4409 "replaced").
 """
 
 import asyncio
 import base64
 import json
 import logging
-import os
 import random
 import struct
 import sys
+import time
 from datetime import datetime, timezone
+
+import aiohttp
 
 log = logging.getLogger("relay")
 
-HEADER_FMT = ">I"  # uint32 BE
-CHUNK_SIZE = 256 * 1024  # 256 KiB
+HEADER_FMT = ">I"
+CHUNK_SIZE = 256 * 1024
 PING_TIMEOUT = 60
 PING_INTERVAL = 20
+RECONNECT_AFTER = 50 * 60  # 50 minutes — proactive refresh
 
 
 class RelayConnector:
@@ -30,18 +38,16 @@ class RelayConnector:
         self.token = token
         self.upstream = upstream.rstrip("/")
 
-        # Normalize: auto-detect protocol for WebSocket
         base = self.relay_base
         if "/agent/ws" in base:
-            # User passed the full WS URL directly
             self.ws_url = base if base.startswith(("ws://", "wss://")) else None
         else:
-            if base.startswith("https://") or base.startswith("wss://"):
+            if base.startswith(("https://", "wss://")):
                 ws_proto = "wss"
-            elif base.startswith("http://") or base.startswith("ws://"):
+            elif base.startswith(("http://", "ws://")):
                 ws_proto = "ws"
             else:
-                ws_proto = "wss"  # default to secure
+                ws_proto = "wss"
             http_clean = base.split("://", 1)[-1] if "://" in base else base
             self.ws_url = f"{ws_proto}://{http_clean}/agent/ws?client={client}"
 
@@ -50,38 +56,57 @@ class RelayConnector:
 
         self._ws = None
         self._session = None
-        self._last_pong = datetime.now(timezone.utc)
-        self._inflight = {}  # id → asyncio.Task
+        self._inflight = {}
 
     # ------------------------------------------------------------------
     async def run(self):
+        """Never-exit reconnect loop with exponential backoff."""
         backoff = 1.0
         while True:
+            started_at = time.monotonic()
             try:
                 await self._run_ws()
-                backoff = 1.0
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                log.exception("WS connection lost")
-            await asyncio.sleep(backoff + random.uniform(0, 1) * 0.5)
-            backoff = min(backoff * 2, 30)
+                log.exception("Relay loop error — will retry")
+            finally:
+                self._cancel_inflight()
 
+            backoff = 1.0  # reset on clean disconnect
+            if time.monotonic() - started_at < 5:
+                # Short-lived connection (likely a refusal / quick error)
+                await asyncio.sleep(backoff + random.uniform(0, 0.5))
+                backoff = min(backoff * 2, 30)
+
+    # ------------------------------------------------------------------
     async def _run_ws(self):
-        import aiohttp
-
         headers = {"Authorization": f"Bearer {self.token}"}
         timeout = aiohttp.ClientTimeout(total=None, sock_read=PING_TIMEOUT + 10)
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            self._session = session
-            async with session.ws_connect(self.ws_url, headers=headers) as ws:
-                self._ws = ws
-                self._last_pong = datetime.now(timezone.utc)
-                log.info("Connected to relay (WS) for client=%s", self.client)
+            try:
+                async with session.ws_connect(
+                    self.ws_url, headers=headers
+                ) as ws:
+                    await self._handle_ws(ws, session)
+            except aiohttp.ClientError as exc:
+                log.error("WS connect failed: %s", exc)
+            except (ConnectionError, OSError) as exc:
+                log.error("WS network error: %s", exc)
 
-                # Kick off health-check / pong watcher
-                watcher = asyncio.create_task(self._watchdog())
+    async def _handle_ws(self, ws, session):
+        self._ws = ws
+        self._session = session
+        self._last_pong = datetime.now(timezone.utc)
+        log.info("Connected to relay (WS) — client=%s url=%s", self.client, self.ws_url)
 
-                async for msg in ws:
+        watcher = asyncio.create_task(self._watchdog())
+        reconnect_timer = asyncio.create_task(self._proactive_reconnect())
+
+        try:
+            async for msg in ws:
+                try:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         await self._on_text(msg.data)
                     elif msg.type == aiohttp.WSMsgType.CLOSE:
@@ -90,43 +115,65 @@ class RelayConnector:
                         if code == 4409:
                             log.warning("Replaced by newer connection — exiting")
                             sys.exit(0)
-                        break
+                        return
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                        break
-
-                watcher.cancel()
+                        log.warning("WS closed (%s)", msg.type)
+                        return
+                except Exception:
+                    log.exception("Error processing WS message — continuing")
+        finally:
+            watcher.cancel()
+            reconnect_timer.cancel()
+            self._ws = None
+            self._session = None
 
     async def _watchdog(self):
         while True:
             await asyncio.sleep(PING_INTERVAL)
             ago = (datetime.now(timezone.utc) - self._last_pong).total_seconds()
             if ago > PING_TIMEOUT:
-                log.error("No pong for %.0fs — closing", ago)
-                if self._ws:
+                log.error("No pong for %.0fs — forcing close", ago)
+                if self._ws and not self._ws.closed:
                     await self._ws.close()
                 return
 
+    async def _proactive_reconnect(self):
+        await asyncio.sleep(RECONNECT_AFTER)
+        log.info("Proactive reconnect after %ds", RECONNECT_AFTER)
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+
     # ------------------------------------------------------------------
     async def _on_text(self, raw):
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("Invalid JSON from relay: %.200s", raw)
+            return
+
         typ = data.get("type")
         if typ == "ping":
             self._last_pong = datetime.now(timezone.utc)
-            if self._ws:
-                await self._ws.send_json({"type": "pong"})
+            await self._ws.send_json({"type": "pong"})
         elif typ == "request":
-            req_id = data["id"]
+            req_id = data.get("id", "?")
             task = asyncio.create_task(self._handle_request(data))
             self._inflight[req_id] = task
-            task.add_done_callback(lambda _: self._inflight.pop(req_id, None))
+            task.add_done_callback(lambda t, rid=req_id: self._inflight.pop(rid, None))
         else:
             log.debug("unhandled frame type=%s", typ)
 
+    def _cancel_inflight(self):
+        for tid, task in list(self._inflight.items()):
+            if not task.done():
+                task.cancel()
+        self._inflight.clear()
+
     # ------------------------------------------------------------------
     async def _handle_request(self, req):
-        req_id = req["id"]
-        method = req["method"]
-        path = req["path"]
+        req_id = req.get("id", "?")
+        method = req.get("method", "GET")
+        path = req.get("path", "/")
         query = req.get("query", "")
         body_b64 = req.get("body_b64")
 
@@ -141,52 +188,66 @@ class RelayConnector:
         try:
             resp = await self._session.request(
                 method, url, data=body,
-                headers={"content-type": req.get("headers", {}).get("content-type", "") or "application/json"}
+                headers={"content-type": req.get("headers", {}).get("content-type", "") or "application/json"},
             )
             status = resp.status
             ct = resp.headers.get("Content-Type", "application/octet-stream")
-            cl = resp.headers.get("Content-Length", "")
-
-            # Read entire body before chunking — aiohttp's StreamReader
-            # returns partial reads, so we can't rely on len(chunk) < N
-            # to detect EOF.
             full_body = await resp.read()
 
+            await self._send_response_start(req_id, status, ct, len(full_body))
+            await self._send_chunks(req_id, full_body)
+
+            log.info("[%s] → %s (%d bytes)", req_id, status, len(full_body))
+        except Exception as exc:
+            log.exception("[%s] upstream error", req_id)
+            await self._send_error(req_id, 502, str(exc))
+
+    async def _send_response_start(self, req_id, status, content_type, body_len):
+        try:
             if self._ws:
                 await self._ws.send_json({
                     "type": "response_start",
                     "id": req_id,
                     "status": status,
-                    "headers": {"content-type": ct, "content-length": str(len(full_body))},
+                    "headers": {
+                        "content-type": content_type,
+                        "content-length": str(body_len),
+                    },
                 })
+        except Exception:
+            log.exception("[%s] failed to send response_start", req_id)
 
-            # Chunked binary frames
-            if not full_body:
-                # Empty body — one final empty chunk
-                if self._ws:
-                    header = json.dumps({"id": req_id, "seq": 0, "final": True})
-                    hb = header.encode()
-                    frame = struct.pack(HEADER_FMT, len(hb)) + hb + b""
-                    await self._ws.send_bytes(frame, compress=False)
-            else:
-                offset = 0
-                seq = 0
-                while offset < len(full_body):
-                    chunk = full_body[offset:offset + CHUNK_SIZE]
-                    final = (offset + CHUNK_SIZE) >= len(full_body)
-                    if self._ws:
-                        header = json.dumps({"id": req_id, "seq": seq, "final": final})
-                        hb = header.encode()
-                        frame = struct.pack(HEADER_FMT, len(hb)) + hb + chunk
-                        await self._ws.send_bytes(frame, compress=False)
-                    offset += CHUNK_SIZE
-                    seq += 1
+    async def _send_chunks(self, req_id, full_body):
+        if not full_body:
+            await self._send_chunk(req_id, 0, b"", True)
+            return
+        offset = 0
+        seq = 0
+        while offset < len(full_body):
+            chunk = full_body[offset:offset + CHUNK_SIZE]
+            final = (offset + CHUNK_SIZE) >= len(full_body)
+            await self._send_chunk(req_id, seq, chunk, final)
+            offset += CHUNK_SIZE
+            seq += 1
 
-            log.info("[%s] → %s", req_id, status)
-        except Exception as exc:
-            log.exception("[%s] upstream error", req_id)
+    async def _send_chunk(self, req_id, seq, chunk, final):
+        try:
+            if self._ws:
+                header = json.dumps({"id": req_id, "seq": seq, "final": final})
+                hb = header.encode()
+                frame = struct.pack(HEADER_FMT, len(hb)) + hb + chunk
+                await self._ws.send_bytes(frame, compress=False)
+        except Exception:
+            log.exception("[%s] failed to send chunk seq=%s", req_id, seq)
+
+    async def _send_error(self, req_id, status, message):
+        try:
             if self._ws:
                 await self._ws.send_json({
-                    "type": "error", "id": req_id,
-                    "status": 502, "message": str(exc),
+                    "type": "error",
+                    "id": req_id,
+                    "status": status,
+                    "message": message,
                 })
+        except Exception:
+            log.exception("[%s] failed to send error frame", req_id)
