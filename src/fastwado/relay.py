@@ -30,8 +30,21 @@ class RelayConnector:
         self.token = token
         self.upstream = upstream.rstrip("/")
 
-        # Transport auto-detection: try WS first, fall back to LP
-        self.ws_url = f"{self.relay_base}/agent/ws?client={client}"
+        # Normalize: auto-detect protocol for WebSocket
+        base = self.relay_base
+        if "/agent/ws" in base:
+            # User passed the full WS URL directly
+            self.ws_url = base if base.startswith(("ws://", "wss://")) else None
+        else:
+            if base.startswith("https://") or base.startswith("wss://"):
+                ws_proto = "wss"
+            elif base.startswith("http://") or base.startswith("ws://"):
+                ws_proto = "ws"
+            else:
+                ws_proto = "wss"  # default to secure
+            http_clean = base.split("://", 1)[-1] if "://" in base else base
+            self.ws_url = f"{ws_proto}://{http_clean}/agent/ws?client={client}"
+
         self.poll_url = f"{self.relay_base}/agent/poll?client={client}"
         self.resp_url_tpl = f"{self.relay_base}/agent/response/{{req_id}}?client={client}"
 
