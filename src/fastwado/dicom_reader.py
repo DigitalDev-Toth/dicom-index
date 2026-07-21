@@ -70,5 +70,15 @@ def read_tags(filepath):
 
 
 def _sanitize(s):
-    """Strip surrogate characters and non-UTF-encodable bytes."""
-    return s.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+    """Recover original bytes from surrogate escapes and decode properly.
+
+    GDCM may return latin-1 characters as lone surrogates in the Python str.
+    We recover the raw bytes with surrogateescape, then try UTF-8 first
+    (for correctly-decoded text), falling back to ISO 8859-1 (latin-1) for
+    Spanish/European names (e.g. 'Ñ', 'á').
+    """
+    b = s.encode("utf-8", errors="surrogateescape")
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("iso-8859-1")
