@@ -186,6 +186,33 @@ def report_cmd(ctx, path):
     click.echo(f"Report written: {rpt_path}")
 
 
+# ── fix-encoding command ────────────────────────────────────────────────
+
+@cli.command("fix-encoding")
+@click.pass_context
+def fix_encoding_cmd(ctx):
+    """Re-read DICOM headers for rows with corrupted latin-1 characters.
+
+    Scans only the file_path entries for studies/series that contain the
+    REPLACEMENT CHARACTER (�), re-reads the original DICOM tag with the
+    corrected sanitizer, and UPDATEs the DB in-place.  Does NOT reprocess
+    pixel data or re-scan the filesystem.
+    """
+    _require_client(ctx)
+    client = ctx.obj["client"]
+    db_url = ctx.obj["db_url"]
+
+    from fastwado.fix_encoding import run_fix
+
+    conn = connect(db_url)
+    try:
+        fixed = run_fix(conn, client, progress=_make_progress)
+    finally:
+        conn.close()
+
+    click.echo(f"Fixed {fixed} text values for client={client}")
+
+
 # ── serve command ───────────────────────────────────────────────────────
 
 @cli.command("serve")
