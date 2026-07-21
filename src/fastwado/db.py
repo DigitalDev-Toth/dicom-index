@@ -523,3 +523,82 @@ def get_series_instance_paths(conn, client, series_iuid, limit=2):
         (client, series_iuid, limit),
     )
     return [r[0] for r in cur.fetchall()]
+
+
+def list_studies(
+    conn,
+    client,
+    date_from=None,
+    date_to=None,
+    modality=None,
+    patient_name=None,
+    patient_id=None,
+    accession_number=None,
+    limit=2000,
+):
+    """Return studies matching the given filters, ordered by study_date DESC.
+
+    *modality* may be a comma-separated string (e.g. "CT,MR").
+    Text fields use ILIKE partial matching.
+    Never returns more than *limit* rows.
+    Returns ``(rows, truncated)`` where *truncated* is True when the
+    result count reached *limit*.
+    """
+    clauses = ["client = %(client)s"]
+    params = {"client": client, "limit": limit + 1}
+
+    if date_from:
+        clauses.append("study_date >= %(date_from)s")
+        params["date_from"] = date_from
+    if date_to:
+        clauses.append("study_date <= %(date_to)s")
+        params["date_to"] = date_to
+    if modality:
+        mods = [m.strip() for m in modality.split(",") if m.strip()]
+        if mods:
+            clauses.append("modalities && %(mods)s")
+            params["mods"] = mods
+    if patient_name:
+        clauses.append("patient_name ILIKE %(patient_name)s")
+        params["patient_name"] = "%" + patient_name + "%"
+    if patient_id:
+        clauses.append("patient_id ILIKE %(patient_id)s")
+        params["patient_id"] = "%" + patient_id + "%"
+    if accession_number:
+        clauses.append("accession_number ILIKE %(accession_number)s")
+        params["accession_number"] = "%" + accession_number + "%"
+
+    where = " AND ".join(clauses)
+
+    cur = conn.cursor()
+    cur.execute(
+        f"""SELECT study_iuid, study_date, study_description,
+                   accession_number, patient_name, patient_id,
+                   patient_sex, patient_birth_date,
+                   modalities, num_series, num_instances
+            FROM studies
+            WHERE {where}
+            ORDER BY study_date DESC NULLS LAST
+            LIMIT %(limit)s""",
+        params,
+    )
+    rows = cur.fetchall()
+    truncated = len(rows) > limit
+
+    result = []
+    for r in rows[:limit]:
+        result.append({
+            "study_iuid": r[0],
+            "study_date": str(r[1]) if r[1] else None,
+            "study_description": r[2],
+            "accession_number": r[3],
+            "patient_name": r[4],
+            "patient_id": r[5],
+            "patient_sex": r[6],
+            "patient_birth_date": str(r[7]) if r[7] else None,
+            "modalities": r[8] if r[8] else [],
+            "num_series": r[9],
+            "num_instances": r[10],
+        })
+
+    return result, truncated

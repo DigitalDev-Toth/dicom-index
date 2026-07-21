@@ -14,6 +14,7 @@ from fastwado.db import (
     get_instance_info,
     get_series_instance_paths,
     get_study_full,
+    list_studies,
 )
 
 log = logging.getLogger(__name__)
@@ -118,6 +119,43 @@ async def debug_echo(request: Request):
         "query": str(request.url.query),
         "full_url": str(request.url),
     }
+
+
+MAX_STUDIES_LIMIT = 2000
+
+
+@app.get("/studies")
+def get_studies(
+    request: Request,
+    client: str = Query(..., min_length=1, description="Client identifier"),
+    date_from: str | None = Query(None, description="YYYY-MM-DD"),
+    date_to: str | None = Query(None, description="YYYY-MM-DD"),
+    modality: str | None = Query(None, description="Comma-separated, e.g. CT,MR"),
+    patient_name: str | None = Query(None),
+    patient_id: str | None = Query(None),
+    accession_number: str | None = Query(None),
+    limit: int | None = Query(None, description="Max results (capped at 2000)"),
+    db_url: str = Query(default="", description="Override DATABASE_URL"),
+):
+    """Worklist: return filtered study list for a client."""
+    dsn = _db_url(request, db_url)
+    conn = connect(dsn)
+    try:
+        rows, truncated = list_studies(
+            conn,
+            client,
+            date_from=date_from,
+            date_to=date_to,
+            modality=modality,
+            patient_name=patient_name,
+            patient_id=patient_id,
+            accession_number=accession_number,
+            limit=min(limit or MAX_STUDIES_LIMIT, MAX_STUDIES_LIMIT),
+        )
+    finally:
+        conn.close()
+
+    return JSONResponse(content={"studies": rows, "truncated": truncated})
 
 
 @app.get("/study/{study_iuid:path}")
