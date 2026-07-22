@@ -298,15 +298,21 @@ def batch_insert_instances(cur, client, rows):
     series_map = {r[0]: r[1] for r in cur.fetchall()}
 
     argslist = []
+    seen = set()
     for r in rows:
         sid = study_map.get(r["study_iuid"])
         seid = series_map.get(r["series_iuid"])
         if sid is None or seid is None:
             log.warning("Missing FK for instance %s", r["sop_iuid"])
             continue
+        sop = r["sop_iuid"]
+        if sop in seen:
+            log.warning("Duplicate SOPInstanceUID in batch: %s", sop)
+            continue
+        seen.add(sop)
         argslist.append((
             client,
-            r["sop_iuid"],
+            sop,
             seid,
             r["series_iuid"],
             sid,
